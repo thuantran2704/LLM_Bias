@@ -115,7 +115,7 @@ def query_phi4(prompt):
                     parsed[name] = score
             except:
                 continue
-        # Fill in missing criteria with default 1
+        # Fill missing criteria with default 1
         for crit in criteria:
             if crit not in parsed:
                 parsed[crit] = 1
@@ -125,13 +125,12 @@ def query_phi4(prompt):
         return {crit: 1 for crit in criteria}
 
 # ------------------------
-# Evaluate candidates with fixed row order
+# Evaluate candidates with justifications study
 # ------------------------
 def evaluate_candidates(start_idx, end_idx):
     transcripts = load_transcripts()
     prosodic = load_prosodic()
 
-    # Ensure fixed candidate order
     candidate_ids = list(range(start_idx, end_idx + 1))
 
     for phase in ["all_features"] + [f"ablation_{f}" for f in features]:
@@ -149,18 +148,34 @@ def evaluate_candidates(start_idx, end_idx):
                 ablate_feat = phase.replace("ablation_", "")
                 included = [f for f in features if f != ablate_feat]
 
-            prompt = build_prompt_all_criteria(included, candidate_data)
-            scores = query_phi4(prompt)
+            # --- 1. Query scores for CSV ---
+            prompt_scores = build_prompt_all_criteria(included, candidate_data)
+            scores = query_phi4(prompt_scores)
 
-            # Build row in **fixed column order**
+            # --- 2. Query justifications for study (not saved) ---
+            prompt_justification = prompt_scores + "\n\nNow, for each criterion, provide a 1-2 sentence justification of your score."
+            try:
+                justification_response = client.generate(
+                    model="phi4-mini:3.8b",
+                    prompt=prompt_justification,
+                    options={"temperature": 0.2}
+                )
+                justifications_text = justification_response.response.strip() if hasattr(justification_response, "response") else str(justification_response).strip()
+                # Optional: print first 300 chars
+                print(f"\n--- Candidate p{idx}, Phase {phase} Justifications ---")
+                print(justifications_text[:300], "...\n")
+            except Exception as e:
+                print(f"Justification query error for Candidate p{idx}: {e}")
+
+            # --- Build row in fixed column order for saving ---
             row = {"Participant": f"p{idx}", "Transcript": candidate_data["transcript"]}
             for crit in criteria:
                 row[crit] = scores.get(crit, 1)
-
             all_results.append(row)
+
             time.sleep(0.2)
 
-        # Create dataframe in **exact column order**
+        # Save CSV with fixed order
         df_wide = pd.DataFrame(all_results)
         df_wide = df_wide[["Participant", "Transcript"] + criteria]
         df_wide.to_csv(output_file, index=False)
