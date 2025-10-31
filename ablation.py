@@ -4,7 +4,16 @@ from ollama import Client
 from tqdm import tqdm
 import time
 
-client = Client()
+# ------------------------
+# CONFIG
+# ------------------------
+TRANSCRIPT_FILE = "interview_transcripts_by_turkers.csv"
+PROSODIC_FILE = "prosodic_features.csv"
+FACIAL_DIR = "Facial_Features"
+SMILE_DIR = "SmileData"
+OUTPUT_DIR = "results"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 criteria = [
     "Overall", "RecommendHiring", "Colleague", "Engaged", "Excited",
@@ -13,18 +22,25 @@ criteria = [
     "Focused", "Authentic", "NotAwkward"
 ]
 
-features = ["transcript", "prosodic", "facial", "smile_pre", "smile_post"]
+features = ["transcript", "prosodic", "facial", "smile"]
+
+client = Client()
 
 # ------------------------
 # Load data
 # ------------------------
-def load_data():
-    transcripts = pd.read_csv("interview_transcripts_by_turkers.csv")
-    prosodic = pd.read_csv("prosodic_features.csv")
-    return transcripts, prosodic
+def load_transcripts():
+    df = pd.read_csv(TRANSCRIPT_FILE, header=None, names=["id", "transcript"])
+    print(f"Loaded {len(df)} transcripts.")
+    return df
+
+def load_prosodic():
+    df = pd.read_csv(PROSODIC_FILE)
+    print(f"Loaded {len(df)} prosodic rows, {df.shape[1]} features.")
+    return df
 
 # ------------------------
-# Helper to read text files
+# Read text helper
 # ------------------------
 def read_file(path):
     if not os.path.exists(path):
@@ -36,24 +52,30 @@ def read_file(path):
 # Get candidate feature bundle
 # ------------------------
 def get_candidate_features(idx, transcripts, prosodic):
-    transcript = transcripts.iloc[idx]["Transcript"] if "Transcript" in transcripts.columns else ""
-    prosodic_rows = prosodic.iloc[idx*5:(idx+1)*5]
+    transcript = transcripts.iloc[idx]["transcript"]
+    start = idx * 5
+    end = start + 5
+    prosodic_rows = prosodic.iloc[start:end]
     prosodic_summary = prosodic_rows.to_string(index=False)
 
-    facial = read_file(f"Facial_Features/candidate{idx+1}.csv")
-    smile_pre = read_file(f"SmileData/pre/candidate{idx+1}.txt")
-    smile_post = read_file(f"SmileData/post/candidate{idx+1}.txt")
+    facial = read_file(os.path.join(FACIAL_DIR, f"candidate{idx+1}.csv"))
+
+    smile_path = (
+        os.path.join(SMILE_DIR, "pre", f"candidate{idx+1}.txt")
+        if idx + 1 <= 69
+        else os.path.join(SMILE_DIR, "post", f"candidate{idx+1 - 69}.txt")
+    )
+    smile = read_file(smile_path)
 
     return {
         "transcript": transcript,
         "prosodic": prosodic_summary,
         "facial": facial,
-        "smile_pre": smile_pre,
-        "smile_post": smile_post
+        "smile": smile
     }
 
 # ------------------------
-# Build one big prompt for all 18 criteria
+# Build prompt
 # ------------------------
 def build_prompt_all_criteria(included_features, candidate_data):
     included_text = "\n\n".join(
@@ -67,10 +89,6 @@ Rate this candidate for the following criteria on a 1–7 scale:
 
 For each criterion, output EXACTLY one line in this format:
 <CriterionName>: <score (1-7)>, <one-line justification>
-
-Example:
-Overall: 6, Confident and friendly
-RecommendHiring: 5, Minor hesitation but professional
 
 Input data (features):
 {included_text}
@@ -86,43 +104,44 @@ def query_phi4(prompt):
         response = client.generate(model="phi4-mini:3.8b", prompt=prompt, options={"temperature": 0.2})
         text = response.response.strip() if hasattr(response, "response") else str(response).strip()
         lines = [l.strip() for l in text.split("\n") if ":" in l]
-        parsed = []
+        parsed = {}
         for line in lines:
             try:
                 name, rest = line.split(":", 1)
                 name = name.strip()
                 score_part = ''.join(c for c in rest if c.isdigit())
                 score = int(score_part[0]) if score_part else 1
-                justification = rest.split(",", 1)[-1].strip() if "," in rest else "No justification"
                 if name in criteria:
-                    parsed.append((name, score, justification))
+                    parsed[name] = score
             except:
                 continue
+        # Fill in missing criteria with default 1
+        for crit in criteria:
+            if crit not in parsed:
+                parsed[crit] = 1
         return parsed
     except Exception as e:
         print(f"Error: {e}")
-        return [(c, 1, "Error") for c in criteria]
+        return {crit: 1 for crit in criteria}
 
 # ------------------------
-# Evaluate range of candidates
+# Evaluate candidates with fixed row order
 # ------------------------
-def evaluate_candidates(start_idx, end_idx, output_file="evaluation_results.csv"):
-    transcripts, prosodic = load_data()
+def evaluate_candidates(start_idx, end_idx):
+    transcripts = load_transcripts()
+    prosodic = load_prosodic()
 
-    # Resume support
-    if os.path.exists(output_file):
-        existing = pd.read_csv(output_file)
-        done = set(zip(existing.Candidate, existing.Phase))
-    else:
-        done = set()
+    # Ensure fixed candidate order
+    candidate_ids = list(range(start_idx, end_idx + 1))
 
-    for idx in tqdm(range(start_idx-1, end_idx)):
-        candidate_data = get_candidate_features(idx, transcripts, prosodic)
-        candidate_id = idx + 1
+    for phase in ["all_features"] + [f"ablation_{f}" for f in features]:
+        output_file = os.path.join(OUTPUT_DIR, f"evaluation_{phase}.csv")
 
-        for phase in ["all_features"] + [f"ablation_{f}" for f in features]:
-            if (candidate_id, phase) in done:
-                continue
+        all_results = []
+        print(f"\n=== Starting phase: {phase} ===")
+
+        for idx in tqdm(candidate_ids):
+            candidate_data = get_candidate_features(idx-1, transcripts, prosodic)
 
             if phase == "all_features":
                 included = features
@@ -131,27 +150,26 @@ def evaluate_candidates(start_idx, end_idx, output_file="evaluation_results.csv"
                 included = [f for f in features if f != ablate_feat]
 
             prompt = build_prompt_all_criteria(included, candidate_data)
-            parsed = query_phi4(prompt)
+            scores = query_phi4(prompt)
 
-            results = []
-            for crit, score, justification in parsed:
-                results.append({
-                    "Candidate": candidate_id,
-                    "Phase": phase,
-                    "Criterion": crit,
-                    "Score": score,
-                    "Justification": justification
-                })
+            # Build row in **fixed column order**
+            row = {"Participant": f"p{idx}", "Transcript": candidate_data["transcript"]}
+            for crit in criteria:
+                row[crit] = scores.get(crit, 1)
 
-            df = pd.DataFrame(results)
-            df.to_csv(output_file, mode="a", header=not os.path.exists(output_file), index=False)
+            all_results.append(row)
             time.sleep(0.2)
 
-    print(f"✅ Finished. Results saved to {output_file}")
+        # Create dataframe in **exact column order**
+        df_wide = pd.DataFrame(all_results)
+        df_wide = df_wide[["Participant", "Transcript"] + criteria]
+        df_wide.to_csv(output_file, index=False)
+        print(f"✅ Saved results to {output_file}")
 
+    print("\n✅ Finished all ablation phases.")
 
 # ------------------------
-# Run script
+# Run
 # ------------------------
 if __name__ == "__main__":
     print("Enter candidate range (e.g., 1 50):")
