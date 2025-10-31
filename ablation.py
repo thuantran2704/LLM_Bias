@@ -2,7 +2,6 @@ import os
 import pandas as pd
 from ollama import Client
 from tqdm import tqdm
-import time
 
 # ------------------------
 # CONFIG
@@ -12,8 +11,10 @@ PROSODIC_FILE = "prosodic_features.csv"
 FACIAL_DIR = "Facial_Features"
 SMILE_DIR = "SmileData"
 OUTPUT_DIR = "results"
+JUSTIFIED_DIR = "justified_results"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(JUSTIFIED_DIR, exist_ok=True)
 
 criteria = [
     "Overall", "RecommendHiring", "Colleague", "Engaged", "Excited",
@@ -40,7 +41,7 @@ def load_prosodic():
     return df
 
 # ------------------------
-# Read text helper
+# Helpers
 # ------------------------
 def read_file(path):
     if not os.path.exists(path):
@@ -48,9 +49,6 @@ def read_file(path):
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read().strip()
 
-# ------------------------
-# Get candidate feature bundle
-# ------------------------
 def get_candidate_features(idx, transcripts, prosodic):
     transcript = transcripts.iloc[idx]["transcript"]
     start = idx * 5
@@ -59,7 +57,6 @@ def get_candidate_features(idx, transcripts, prosodic):
     prosodic_summary = prosodic_rows.to_string(index=False)
 
     facial = read_file(os.path.join(FACIAL_DIR, f"candidate{idx+1}.csv"))
-
     smile_path = (
         os.path.join(SMILE_DIR, "pre", f"candidate{idx+1}.txt")
         if idx + 1 <= 69
@@ -75,7 +72,7 @@ def get_candidate_features(idx, transcripts, prosodic):
     }
 
 # ------------------------
-# Build prompt
+# Prompt builders
 # ------------------------
 def build_prompt_all_criteria(included_features, candidate_data):
     included_text = "\n\n".join(
@@ -88,9 +85,28 @@ Rate this candidate for the following criteria on a 1–7 scale:
 {crit_list}
 
 For each criterion, output EXACTLY one line in this format:
-<CriterionName>: <score (1-7)>, <one-line justification>
+<CriterionName>: <score (1-7)>
 
 Input data (features):
+{included_text}
+
+Output:
+"""
+
+def build_prompt_with_justification(included_features, candidate_data):
+    included_text = "\n\n".join(
+        f"{feat.capitalize()}:\n{candidate_data[feat]}" for feat in included_features
+    )
+    crit_list = ", ".join(criteria)
+    return f"""You are an expert interviewer evaluator.
+
+Rate this candidate for the following criteria (1–7 scale):
+{crit_list}
+
+For each criterion, output EXACTLY one line in this format:
+<CriterionName>: <score (1-7)>, <short justification (1–2 sentences) explaining the rating>
+
+Input data (features provided):
 {included_text}
 
 Output:
@@ -101,10 +117,20 @@ Output:
 # ------------------------
 def query_phi4(prompt):
     try:
-        response = client.generate(model="phi4-mini:3.8b", prompt=prompt, options={"temperature": 0.2})
-        text = response.response.strip() if hasattr(response, "response") else str(response).strip()
+        response_text = ""
+        for chunk in client.generate(
+            model="phi4-mini:3.8b",
+            prompt=prompt,
+            options={"temperature": 0.2},
+            stream=True
+        ):
+            if isinstance(chunk, dict) and "response" in chunk:
+                response_text += chunk["response"]
+
+        text = response_text.strip()
         lines = [l.strip() for l in text.split("\n") if ":" in l]
         parsed = {}
+
         for line in lines:
             try:
                 name, rest = line.split(":", 1)
@@ -115,28 +141,35 @@ def query_phi4(prompt):
                     parsed[name] = score
             except:
                 continue
-        # Fill missing criteria with default 1
+
         for crit in criteria:
             if crit not in parsed:
                 parsed[crit] = 1
-        return parsed
+
+        return parsed, text
     except Exception as e:
         print(f"Error: {e}")
-        return {crit: 1 for crit in criteria}
+        return {crit: 1 for crit in criteria}, "Error"
 
 # ------------------------
-# Evaluate candidates with justifications study
+# Main evaluation
 # ------------------------
 def evaluate_candidates(start_idx, end_idx):
     transcripts = load_transcripts()
     prosodic = load_prosodic()
-
     candidate_ids = list(range(start_idx, end_idx + 1))
 
     for phase in ["all_features"] + [f"ablation_{f}" for f in features]:
-        output_file = os.path.join(OUTPUT_DIR, f"evaluation_{phase}.csv")
+        if phase == "all_features":
+            output_file = os.path.join(OUTPUT_DIR, "All_features.csv")
+            justified_file = os.path.join(JUSTIFIED_DIR, "All_features_justified.csv")
+        else:
+            feature_name = phase.replace("ablation_", "")
+            output_file = os.path.join(OUTPUT_DIR, f"ablation_{feature_name}.csv")
+            justified_file = os.path.join(JUSTIFIED_DIR, f"ablation_{feature_name}_justified.csv")
 
         all_results = []
+        justified_results = []
         print(f"\n=== Starting phase: {phase} ===")
 
         for idx in tqdm(candidate_ids):
@@ -148,40 +181,37 @@ def evaluate_candidates(start_idx, end_idx):
                 ablate_feat = phase.replace("ablation_", "")
                 included = [f for f in features if f != ablate_feat]
 
-            # --- 1. Query scores for CSV ---
+            # --- Attempt 1: Ablation scores ---
             prompt_scores = build_prompt_all_criteria(included, candidate_data)
-            scores = query_phi4(prompt_scores)
+            scores, _ = query_phi4(prompt_scores)
 
-            # --- 2. Query justifications for study (not saved) ---
-            prompt_justification = prompt_scores + "\n\nNow, for each criterion, provide a 1-2 sentence justification of your score."
-            try:
-                justification_response = client.generate(
-                    model="phi4-mini:3.8b",
-                    prompt=prompt_justification,
-                    options={"temperature": 0.2}
-                )
-                justifications_text = justification_response.response.strip() if hasattr(justification_response, "response") else str(justification_response).strip()
-                # Optional: print first 300 chars
-                print(f"\n--- Candidate p{idx}, Phase {phase} Justifications ---")
-                print(justifications_text[:300], "...\n")
-            except Exception as e:
-                print(f"Justification query error for Candidate p{idx}: {e}")
-
-            # --- Build row in fixed column order for saving ---
             row = {"Participant": f"p{idx}", "Transcript": candidate_data["transcript"]}
             for crit in criteria:
                 row[crit] = scores.get(crit, 1)
+            row["Total"] = sum(row[c] for c in criteria)
             all_results.append(row)
 
-            time.sleep(0.2)
+            # --- Attempt 2: Justification ---
+            prompt_just = build_prompt_with_justification(included, candidate_data)
+            _, justification_text = query_phi4(prompt_just)
+            justified_results.append({
+                "Participant": f"p{idx}",
+                "Transcript": candidate_data["transcript"],
+                "JustifiedOutput": justification_text
+            })
 
-        # Save CSV with fixed order
-        df_wide = pd.DataFrame(all_results)
-        df_wide = df_wide[["Participant", "Transcript"] + criteria]
-        df_wide.to_csv(output_file, index=False)
+        # Save both CSVs
+        df = pd.DataFrame(all_results)
+        df = df[["Participant", "Transcript"] + criteria + ["Total"]]
+        df.to_csv(output_file, index=False, encoding="utf-8-sig")
+
+        df_just = pd.DataFrame(justified_results)
+        df_just.to_csv(justified_file, index=False, encoding="utf-8-sig")
+
         print(f"✅ Saved results to {output_file}")
+        print(f"✅ Saved justifications to {justified_file}")
 
-    print("\n✅ Finished all ablation phases.")
+    print("\n✅ Finished all ablation and justification phases.")
 
 # ------------------------
 # Run
