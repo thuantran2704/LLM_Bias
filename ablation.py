@@ -2,6 +2,7 @@ import os
 import pandas as pd
 from ollama import Client
 from tqdm import tqdm
+import numpy as np
 
 # ------------------------
 # CONFIG
@@ -40,52 +41,68 @@ def load_prosodic():
 # ------------------------
 # Helpers
 # ------------------------
-def read_file(path):
+def read_file(path, max_lines=20):
+    """Read file and return first max_lines lines as summary."""
     if not os.path.exists(path):
         return ""
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read().strip()
+        lines = f.readlines()
+    # summarize first max_lines
+    return "".join(lines[:max_lines]).strip()
+
+def summarize_prosodic(df_rows):
+    """Return a short summary of prosodic features."""
+    numeric_cols = df_rows.select_dtypes(include=np.number).columns
+    summary = []
+    for col in numeric_cols:
+        mean_val = df_rows[col].mean()
+        summary.append(f"{col}_mean={mean_val:.3f}")
+    return ", ".join(summary)
 
 def get_candidate_features(idx, transcripts, prosodic):
     transcript = transcripts.iloc[idx]["transcript"]
+
     start = idx * 5
     end = start + 5
     prosodic_rows = prosodic.iloc[start:end]
-    prosodic_summary = prosodic_rows.to_string(index=False)
+    prosodic_summary = summarize_prosodic(prosodic_rows)
 
-    facial = read_file(os.path.join(FACIAL_DIR, f"candidate{idx+1}.csv"))
+    facial_file = os.path.join(FACIAL_DIR, f"candidate{idx+1}.csv")
+    facial_summary = read_file(facial_file, max_lines=10)
+
     smile_path = (
         os.path.join(SMILE_DIR, "pre", f"candidate{idx+1}.txt")
         if idx + 1 <= 69
         else os.path.join(SMILE_DIR, "post", f"candidate{idx+1 - 69}.txt")
     )
-    smile = read_file(smile_path)
+    smile_summary = read_file(smile_path, max_lines=10)
 
     return {
         "transcript": transcript,
         "prosodic": prosodic_summary,
-        "facial": facial,
-        "smile": smile
+        "facial": facial_summary,
+        "smile": smile_summary
     }
 
 # ------------------------
 # Build prompt for one criterion
 # ------------------------
 def build_prompt(candidate_data, included_features, criterion):
-    feature_text = "\n\n".join(f"{feat.capitalize()}:\n{candidate_data[feat]}" for feat in included_features)
+    feature_text = "\n\n".join(
+        f"{feat.capitalize()}:\n{candidate_data[feat]}" for feat in included_features
+    )
     return f"""You are an expert interviewer evaluator.
 
 Rate the candidate for ONE criterion only: {criterion}.
 
-Required output format:
-<score>;<short justification (1-2 sentences)>
-- Score must be an integer from 1 to 7.
-- Do not include anything else besides <score>;<justification>.
-
-Input data:
+Input data (features provided):
 {feature_text}
 
-Output:
+Output format:
+<score>;<short justification (1-2 sentences)>
+- Score must be integer 1-7
+- Do not write anything else
+- If unsure, pick a score
 """
 
 # ------------------------
@@ -97,14 +114,14 @@ def query_phi4(prompt):
         for chunk in client.generate(
             model="phi4-mini:3.8b",
             prompt=prompt,
-            options={"temperature": 0.2},
+            options={"temperature": 0.3},
             stream=True
         ):
             if isinstance(chunk, dict) and "response" in chunk:
                 response_text += chunk["response"]
 
-        # Take first line and parse
         first_line = response_text.strip().split("\n")[0]
+
         if ";" in first_line:
             score_text = first_line.split(";")[0].strip()
             try:
@@ -120,13 +137,42 @@ def query_phi4(prompt):
                 print(f"❗ Model output: {first_line}")
                 return None, first_line
         else:
-            print(f"⚠️ No semicolon in output.")
+            print(f"⚠️ No semicolon in output")
             print(f"❗ Model output: {first_line}")
             return None, first_line
     except Exception as e:
         print(f"❌ Model query failed: {e}")
         return None, "Error"
 
+# ------------------------
+# Quick sanity check
+# ------------------------
+def sanity_check():
+    print("🔹 Running model sanity check...")
+    test_prompt = """You are an expert interviewer evaluator.
+
+Rate the candidate for ONE criterion only: Overall.
+
+Input data: Candidate answered clearly and confidently.
+
+Output format:
+<score>;<short justification>
+- Score must be integer 1-7
+- Do not write anything else
+- If unsure, pick a score
+"""
+    response_text = ""
+    for chunk in client.generate(
+        model="phi4-mini:3.8b",
+        prompt=test_prompt,
+        options={"temperature": 0.3},
+        stream=True
+    ):
+        if isinstance(chunk, dict) and "response" in chunk:
+            response_text += chunk["response"]
+    print("Sanity check response:")
+    print(response_text.strip())
+    print("🔹 End of sanity check\n")
 
 # ------------------------
 # Main evaluation
@@ -160,9 +206,9 @@ def evaluate_candidates(start_idx, end_idx):
 
             for crit in criteria:
                 prompt = build_prompt(candidate_data, included, crit)
-                score, _ = query_phi4(prompt)
+                score, output_line = query_phi4(prompt)
                 if score is None:
-                    score = 1  # fallback if model fails
+                    score = 1  # fallback
                 row[crit] = score
                 total += score
 
@@ -182,4 +228,9 @@ def evaluate_candidates(start_idx, end_idx):
 if __name__ == "__main__":
     print("Enter candidate range (e.g., 1 50):")
     start, end = map(int, input().split())
+
+    # Run sanity check first
+    sanity_check()
+
+    # Evaluate candidates
     evaluate_candidates(start, end)
