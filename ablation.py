@@ -151,7 +151,7 @@ for i, transcript in enumerate(tqdm(subset, desc="Grading candidates")):
     features = {
         "Transcript": transcript,
         "Facial_Features": load_facial_features(s + i),
-        # "SmileData": load_smile_data(s + i)
+        "SmileData": load_smile_data(s + i)
         "Prosodic_Features": load_prosodic_features(s + i)
     }
     
