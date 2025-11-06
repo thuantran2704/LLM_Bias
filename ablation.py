@@ -142,10 +142,12 @@ for ablation_name, features_to_include in ablation_sets.items():
         rows.append(row)
     
     output_file = OUTPUT.replace(".csv", f"_{ablation_name}.csv")
-    header = ["Participant","Transcript"] + CRITERIA + ["Total"]
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
+    file_exists = os.path.exists(output_file)
+
+    with open(output_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=header)
-        writer.writeheader()
+        if not file_exists:
+            writer.writeheader()  # write header only if file is new
         writer.writerows(rows)
     
     print(f"✅ Saved to {output_file}")
