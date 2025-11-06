@@ -1,10 +1,11 @@
-import csv, os, itertools
+import csv, os
 from ollama import Client
 from tqdm import tqdm
 import pandas as pd
 
 MODEL = "phi4-mini:3.8b"
 INPUT = "interview_transcripts_by_turkers.csv"
+OUTPUT = "candidate_grades.csv"
 FACIAL_FEATURES_DIR = "Facial_Features"
 SMILE_DATA_DIR = "SmileData"
 PRE_COUNT = 69
@@ -20,47 +21,42 @@ client = Client()
 # ------------------------
 # Feature loaders
 # ------------------------
-def load_prosodic_features(idx, file_path="prosodic_features.csv"):
+def load_prosodic_features(participant_index, file_path="prosodic_features.csv"):
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f.readlines() if line.strip()]
-            if len(lines) < 2:
-                return ""
+            if len(lines) < 2: return ""
             header = lines[0]
-            start = 1 + idx * 5
+            start = 1 + participant_index * 5
             end = start + 5
-            if start >= len(lines):
-                return ""
+            if start >= len(lines): return ""
             return header + "\n" + "\n".join(lines[start:end])
-    except:
-        return ""
+    except: return ""
 
-def load_facial_features(idx):
+def load_facial_features(participant_index):
     files = sorted(os.listdir(FACIAL_FEATURES_DIR))
-    if idx < len(files):
-        path = os.path.join(FACIAL_FEATURES_DIR, files[idx])
+    if participant_index < len(files):
+        path = os.path.join(FACIAL_FEATURES_DIR, files[participant_index])
         try:
             df = pd.read_csv(path)
             return df.to_csv(index=False)
-        except:
-            return ""
+        except: return ""
     return ""
 
-def load_smile_data(idx):
-    folder = "pre" if idx < PRE_COUNT else "post"
-    file_index = idx if idx < PRE_COUNT else idx - PRE_COUNT
+def load_smile_data(participant_index):
+    folder = "pre" if participant_index < PRE_COUNT else "post"
+    file_index = participant_index if participant_index < PRE_COUNT else participant_index - PRE_COUNT
     folder_path = os.path.join(SMILE_DATA_DIR, folder)
     try:
         files = sorted([f for f in os.listdir(folder_path) if f.endswith(".txt")])
         if file_index < len(files):
             with open(os.path.join(folder_path, files[file_index]), "r", encoding="utf-8") as f:
                 return f.read()
-    except:
-        pass
+    except: pass
     return ""
 
 # ------------------------
-# Prompt & scoring
+# Prompt builder & scoring
 # ------------------------
 def build_prompt(features_dict, criterion):
     feature_lines = [f"{k}:\n\"\"\"{v}\"\"\"" for k, v in features_dict.items()]
@@ -89,8 +85,7 @@ def ask_score_dynamic(features_dict, criterion, max_retries=5):
                 score_str = text.split(";", 1)[0].strip()
                 if score_str.isdigit() and 1 <= int(score_str) <= 7:
                     return int(score_str)
-        except:
-            pass
+        except: pass
     return 0
 
 def grade_candidate(features_dict):
@@ -108,9 +103,8 @@ s, e = map(int, input(f"Range (0–{len(transcripts)-1}) start,end: ").split(","
 subset = transcripts[s:e]
 
 # ------------------------
-# Dynamic ablation
+# Build base features dict for all candidates
 # ------------------------
-# base feature dict for all candidates
 base_features_list = []
 for i, transcript in enumerate(subset):
     idx = s + i
@@ -122,26 +116,24 @@ for i, transcript in enumerate(subset):
     }
     base_features_list.append(base_features)
 
-# Get all feature names (keys) except Transcript (usually keep it)
-all_features = list(base_features_list[0].keys())
-all_features.remove("Transcript")  # optional: never ablate transcript
+# ------------------------
+# Determine ablation sets dynamically (Transcript can be ablated now)
+# ------------------------
+all_features = list(base_features_list[0].keys())  # include Transcript
 
-# Generate ablation combinations
-ablation_sets = {"full": all_features.copy()}
-for r in range(1, len(all_features)+1):
-    for combo in itertools.combinations(all_features, r):
-        name = "ablation_" + "_".join([f for f in all_features if f not in combo])
-        ablation_sets[name] = list(combo)
+ablation_sets = {"full": all_features.copy()}  # full run with all features
+# single-feature ablations
+for f in all_features:
+    ablation_sets[f"ablation_{f}"] = [feat for feat in all_features if feat != f]
 
 # ------------------------
-# Run grading for each ablation set
+# Grade candidates for each ablation set
 # ------------------------
 for ablation_name, features_to_include in ablation_sets.items():
     print(f"\nGrading candidates: {ablation_name}")
     rows = []
-    
     for i, base_features in enumerate(tqdm(base_features_list, desc=f"Grading {ablation_name}")):
-        features = {"Transcript": base_features["Transcript"]}
+        features = {}
         for f in features_to_include:
             features[f] = base_features[f]
         scores = grade_candidate(features)
@@ -149,7 +141,7 @@ for ablation_name, features_to_include in ablation_sets.items():
         row.update(scores)
         rows.append(row)
     
-    output_file = f"candidate_grades_{ablation_name}.csv"
+    output_file = OUTPUT.replace(".csv", f"_{ablation_name}.csv")
     header = ["Participant","Transcript"] + CRITERIA + ["Total"]
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=header)
