@@ -1,217 +1,159 @@
-import os
-import pandas as pd
+import csv, os, itertools
 from ollama import Client
 from tqdm import tqdm
-import numpy as np
+import pandas as pd
 
-# ------------------------
-# CONFIG
-# ------------------------
-OLLAMA_MODEL = "phi4-mini:3.8b"  # Change model name here
-INCLUDE_JUSTIFICATION = True      # Set False to skip justification
+MODEL = "phi4-mini:3.8b"
+INPUT = "interview_transcripts_by_turkers.csv"
+FACIAL_FEATURES_DIR = "Facial_Features"
+SMILE_DATA_DIR = "SmileData"
+PRE_COUNT = 69
 
-TRANSCRIPT_FILE = "interview_transcripts_by_turkers.csv"
-PROSODIC_FILE = "prosodic_features.csv"
-FACIAL_DIR = "Facial_Features"
-SMILE_DIR = "SmileData"
-
-OUTPUT_DIR = "results" if INCLUDE_JUSTIFICATION else "results_no_justified"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-criteria = [
-    "Overall", "RecommendHiring", "Colleague", "Engaged", "Excited",
-    "EyeContact", "Smiled", "SpeakingRate", "NoFillers", "Friendly",
-    "Paused", "EngagingTone", "StructuredAnswers", "Calm", "NotStressed",
-    "Focused", "Authentic", "NotAwkward"
+CRITERIA = [
+    "Overall","RecommendHiring","Colleague","Engaged","Excited","EyeContact",
+    "Smiled","SpeakingRate","NoFillers","Friendly","Paused","EngagingTone",
+    "StructuredAnswers","Calm","NotStressed","Focused","Authentic","NotAwkward"
 ]
-
-features = ["transcript", "prosodic", "facial", "smile"]
 
 client = Client()
 
-def load_transcripts():
-    df = pd.read_csv(TRANSCRIPT_FILE, header=None, names=["id", "transcript"])
-    print(f"Loaded {len(df)} transcripts.")
-    return df
-
-def load_prosodic():
-    df = pd.read_csv(PROSODIC_FILE)
-    print(f"Loaded {len(df)} prosodic rows, {df.shape[1]} features.")
-    return df
-
-def read_file(path, max_lines=20):
-    if not os.path.exists(path):
+# ------------------------
+# Feature loaders
+# ------------------------
+def load_prosodic_features(idx, file_path="prosodic_features.csv"):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+            if len(lines) < 2:
+                return ""
+            header = lines[0]
+            start = 1 + idx * 5
+            end = start + 5
+            if start >= len(lines):
+                return ""
+            return header + "\n" + "\n".join(lines[start:end])
+    except:
         return ""
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
-    return "".join(lines[:max_lines]).strip()
 
-def summarize_prosodic(df_rows):
-    numeric_cols = df_rows.select_dtypes(include=np.number).columns
-    summary = []
-    for col in numeric_cols:
-        mean_val = df_rows[col].mean()
-        summary.append(f"{col}_mean={mean_val:.3f}")
-    return ", ".join(summary)
+def load_facial_features(idx):
+    files = sorted(os.listdir(FACIAL_FEATURES_DIR))
+    if idx < len(files):
+        path = os.path.join(FACIAL_FEATURES_DIR, files[idx])
+        try:
+            df = pd.read_csv(path)
+            return df.to_csv(index=False)
+        except:
+            return ""
+    return ""
 
-def get_candidate_features(idx, transcripts, prosodic):
-    transcript = transcripts.iloc[idx]["transcript"]
-    start = idx * 5
-    end = start + 5
-    prosodic_rows = prosodic.iloc[start:end]
-    prosodic_summary = summarize_prosodic(prosodic_rows)
-    facial_file = os.path.join(FACIAL_DIR, f"candidate{idx+1}.csv")
-    facial_summary = read_file(facial_file, max_lines=10)
-    smile_path = (
-        os.path.join(SMILE_DIR, "pre", f"candidate{idx+1}.txt")
-        if idx + 1 <= 69
-        else os.path.join(SMILE_DIR, "post", f"candidate{idx+1 - 69}.txt")
-    )
-    smile_summary = read_file(smile_path, max_lines=10)
-    return {
-        "transcript": transcript,
-        "prosodic": prosodic_summary,
-        "facial": facial_summary,
-        "smile": smile_summary
-    }
+def load_smile_data(idx):
+    folder = "pre" if idx < PRE_COUNT else "post"
+    file_index = idx if idx < PRE_COUNT else idx - PRE_COUNT
+    folder_path = os.path.join(SMILE_DATA_DIR, folder)
+    try:
+        files = sorted([f for f in os.listdir(folder_path) if f.endswith(".txt")])
+        if file_index < len(files):
+            with open(os.path.join(folder_path, files[file_index]), "r", encoding="utf-8") as f:
+                return f.read()
+    except:
+        pass
+    return ""
 
-def build_prompt(candidate_data, included_features, criterion):
-    feature_text = "\n\n".join(
-        f"{feat.capitalize()}:\n{candidate_data[feat]}" for feat in included_features
-    )
-    if INCLUDE_JUSTIFICATION:
-        output_format = (
-            "<score>;<short justification (1-2 sentences)>\n"
-            "- Score must be integer 1-7\n"
-            "- Do not write anything else"
-        )
-    else:
-        output_format = (
-            "<score>\n"
-            "- Score must be integer 1-7\n"
-            "- Do not write anything else"
-        )
+# ------------------------
+# Prompt & scoring
+# ------------------------
+def build_prompt(features_dict, criterion):
+    feature_lines = [f"{k}:\n\"\"\"{v}\"\"\"" for k, v in features_dict.items()]
+    features_text = "\n\n".join(feature_lines)
+    return f"""
+You are an interview evaluator.
+Rate the candidate on the criterion "{criterion}" based on the following information:
 
-    return f"""You are an expert interviewer evaluator.
+{features_text}
 
-Rate the candidate for ONE criterion only: {criterion}.
-
-Input data (features provided):
-{feature_text}
-
-Output format:
-{output_format}
+Rules:
+- Output exactly in this format:
+  score;justification
+- score = integer 1–7
+- justification = 1–2 sentences explaining the score
+- Do NOT include extra text
 """
 
-def query_phi4(prompt):
-    try:
-        response_text = ""
-        for chunk in client.generate(
-            model=OLLAMA_MODEL,
-            prompt=prompt,
-            options={"temperature": 0.3},
-            stream=True
-        ):
-            if isinstance(chunk, dict) and "response" in chunk:
-                response_text += chunk["response"]
-
-        first_line = response_text.strip().split("\n")[0]
-        if ";" in first_line:
-            score_text = first_line.split(";")[0].strip()
-        else:
-            score_text = first_line.strip()
-
+def ask_score_dynamic(features_dict, criterion, max_retries=5):
+    for _ in range(max_retries):
+        prompt = build_prompt(features_dict, criterion)
         try:
-            score = int(score_text)
-            if 1 <= score <= 7:
-                return score, first_line
-            else:
-                print(f"Score out of range: {score_text}")
-                print(f"Model output: {first_line}")
-                return None, first_line
+            r = client.generate(model=MODEL, prompt=prompt)
+            text = r["response"].strip()
+            if ";" in text:
+                score_str = text.split(";", 1)[0].strip()
+                if score_str.isdigit() and 1 <= int(score_str) <= 7:
+                    return int(score_str)
         except:
-            print(f"Could not parse score: {score_text}")
-            print(f"Model output: {first_line}")
-            return None, first_line
-    except Exception as e:
-        print(f"Model query failed: {e}")
-        return None, "Error"
+            pass
+    return 0
 
-def sanity_check():
-    print("Running model sanity check...")
-    if INCLUDE_JUSTIFICATION:
-        test_prompt = """You are an expert interviewer evaluator.
+def grade_candidate(features_dict):
+    scores = {c: ask_score_dynamic(features_dict, c) for c in CRITERIA}
+    scores["Total"] = sum(scores.values())
+    return scores
 
-Rate the candidate for ONE criterion only: Overall.
+# ------------------------
+# Load transcripts
+# ------------------------
+with open(INPUT, encoding="utf-8") as f:
+    transcripts = [r[0] for r in csv.reader(f) if r]
 
-Input data: Candidate answered clearly and confidently.
+s, e = map(int, input(f"Range (0–{len(transcripts)-1}) start,end: ").split(","))
+subset = transcripts[s:e]
 
-Output format:
-<score>;<short justification>"""
-    else:
-        test_prompt = """You are an expert interviewer evaluator.
+# ------------------------
+# Dynamic ablation
+# ------------------------
+# base feature dict for all candidates
+base_features_list = []
+for i, transcript in enumerate(subset):
+    idx = s + i
+    base_features = {
+        "Transcript": transcript,
+        "Facial_Features": load_facial_features(idx),
+        "Prosodic_Features": load_prosodic_features(idx),
+        "SmileData": load_smile_data(idx)
+    }
+    base_features_list.append(base_features)
 
-Rate the candidate for ONE criterion only: Overall.
+# Get all feature names (keys) except Transcript (usually keep it)
+all_features = list(base_features_list[0].keys())
+all_features.remove("Transcript")  # optional: never ablate transcript
 
-Input data: Candidate answered clearly and confidently.
+# Generate ablation combinations
+ablation_sets = {"full": all_features.copy()}
+for r in range(1, len(all_features)+1):
+    for combo in itertools.combinations(all_features, r):
+        name = "ablation_" + "_".join([f for f in all_features if f not in combo])
+        ablation_sets[name] = list(combo)
 
-Output format:
-<score>"""
-
-    response_text = ""
-    for chunk in client.generate(
-        model=OLLAMA_MODEL,
-        prompt=test_prompt,
-        options={"temperature": 0.3},
-        stream=True
-    ):
-        if isinstance(chunk, dict) and "response" in chunk:
-            response_text += chunk["response"]
-    print("Sanity check response:")
-    print(response_text.strip())
-    print("End of sanity check\n")
-
-def evaluate_candidates(start_idx, end_idx):
-    transcripts = load_transcripts()
-    prosodic = load_prosodic()
-    candidate_ids = list(range(start_idx, end_idx + 1))
-
-    for phase in ["all_features"] + [f"ablation_{f}" for f in features]:
-        output_file = (
-            os.path.join(OUTPUT_DIR, "All_features.csv")
-            if phase == "all_features"
-            else os.path.join(OUTPUT_DIR, f"{phase}.csv")
-        )
-        print(f"\n=== Starting phase: {phase} ===")
-        rows = []
-
-        for idx in tqdm(candidate_ids):
-            candidate_data = get_candidate_features(idx - 1, transcripts, prosodic)
-            included = features if phase == "all_features" else [
-                f for f in features if f != phase.replace("ablation_", "")
-            ]
-
-            row = {"Participant": f"p{idx}", "Transcript": candidate_data["transcript"]}
-            total = 0
-            for crit in criteria:
-                prompt = build_prompt(candidate_data, included, crit)
-                score, output_line = query_phi4(prompt)
-                if score is None:
-                    score = 1
-                row[crit] = score
-                total += score
-            row["Total"] = total
-            rows.append(row)
-
-        df = pd.DataFrame(rows)
-        df = df[["Participant", "Transcript"] + criteria + ["Total"]]
-        df.to_csv(output_file, index=False, encoding="utf-8-sig")
-        print(f"Saved results to {output_file}")
-
-    print("Finished all candidates.")
-
-if __name__ == "__main__":
-    print("Enter candidate range (e.g., 1 50):")
-    start, end = map(int, input().split())
-    sanity_check()
-    evaluate_candidates(start, end)
+# ------------------------
+# Run grading for each ablation set
+# ------------------------
+for ablation_name, features_to_include in ablation_sets.items():
+    print(f"\nGrading candidates: {ablation_name}")
+    rows = []
+    
+    for i, base_features in enumerate(tqdm(base_features_list, desc=f"Grading {ablation_name}")):
+        features = {"Transcript": base_features["Transcript"]}
+        for f in features_to_include:
+            features[f] = base_features[f]
+        scores = grade_candidate(features)
+        row = {"Participant": s + i + 1, "Transcript": ""}
+        row.update(scores)
+        rows.append(row)
+    
+    output_file = f"candidate_grades_{ablation_name}.csv"
+    header = ["Participant","Transcript"] + CRITERIA + ["Total"]
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        writer.writeheader()
+        writer.writerows(rows)
+    
+    print(f"✅ Saved to {output_file}")
