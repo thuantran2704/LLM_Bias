@@ -11,7 +11,7 @@ INPUT = "interview_transcripts_by_turkers.csv"
 FACIAL_FEATURES_DIR = "Facial_Features"
 SMILE_DATA_DIR = "SmileData"
 PROSODIC_FILE = "prosodic_features.csv"
-PRE_COUNT = 69  # number of pre candidates
+PRE_COUNT = 70  # number of pre candidates
 
 CRITERIA = [
     "Overall","RecommendHiring","Colleague","Engaged","Excited","EyeContact",
@@ -44,14 +44,17 @@ def load_prosodic_features(participant_index, file_path=PROSODIC_FILE):
         return ""
 
 def load_facial_features(participant_index):
-    files = sorted(os.listdir(FACIAL_FEATURES_DIR))
-    if participant_index < len(files):
-        path = os.path.join(FACIAL_FEATURES_DIR, files[participant_index])
-        try:
+    try:
+        files = sorted(
+            os.listdir(FACIAL_FEATURES_DIR),
+            key=lambda x: int(re.findall(r'\d+', x)[0])
+        )
+        if participant_index < len(files):
+            path = os.path.join(FACIAL_FEATURES_DIR, files[participant_index])
             df = pd.read_csv(path)
             return df.to_csv(index=False)
-        except:
-            return ""
+    except:
+        pass
     return ""
 
 def load_smile_data(participant_index):
@@ -121,20 +124,20 @@ def grade_candidate(features_dict):
 # ------------------------
 # CORE GRADING FUNCTION
 # ------------------------
-def run_grading(output_file, features_to_include, transcripts, s):
+def run_grading(output_file, features_to_include, transcripts, start_index):
     rows = []
     for i, transcript in enumerate(tqdm(transcripts, desc=f"Grading {output_file}")):
         # dynamically load selected features
         all_features = {
             "Transcript": transcript,
-            "Facial_Features": load_facial_features(s + i),
-            "SmileData": load_smile_data(s + i),
-            "Prosodic_Features": load_prosodic_features(s + i)
+            "Facial_Features": load_facial_features(start_index + i),
+            "SmileData": load_smile_data(start_index + i),
+            "Prosodic_Features": load_prosodic_features(start_index + i)
         }
         # filter out removed features
         features = {k: v for k, v in all_features.items() if k in features_to_include}
         scores = grade_candidate(features)
-        row = {"Participant": s + i + 1}
+        row = {"Participant": start_index + i + 1}
         row.update(scores)
         rows.append(row)
 
@@ -148,18 +151,21 @@ def run_grading(output_file, features_to_include, transcripts, s):
 # ------------------------
 # MAIN EXECUTION
 # ------------------------
-with open(INPUT, encoding="utf-8") as f:
-    transcripts = [r[0] for r in csv.reader(f) if r]
+if __name__ == "__main__":
+    with open(INPUT, encoding="utf-8") as f:
+        transcripts = [r[0] for r in csv.reader(f) if r]
 
-s, e = map(int, input(f"Range (0–{len(transcripts)-1}) start,end: ").split(","))
-subset = transcripts[s:e]
+    # Ask for range (inclusive)
+    s, e = map(int, input(f"Range (0–{len(transcripts)-1}) start,end inclusive: ").split(","))
+    subset = transcripts[s : e + 1]  # include the end participant
 
-# All features
-all_features = ["Transcript", "Facial_Features", "SmileData", "Prosodic_Features"]
-run_grading("all_feature.csv", all_features, subset, s)
+    # All features
+    all_features = ["Transcript", "Facial_Features", "SmileData", "Prosodic_Features"]
+    run_grading("all_feature.csv", all_features, subset, s)
 
-# Ablation (remove one feature at a time)
-for ftr in all_features:
-    features_left = [x for x in all_features if x != ftr]
-    output_name = f"ablation_{ftr}.csv"
-    run_grading(output_name, features_left, subset, s)
+    # Ablation (remove one feature at a time)
+    for ftr in all_features:
+        features_left = [x for x in all_features if x != ftr]
+        output_name = f"ablation_{ftr}.csv"
+        run_grading(output_name, features_left, subset, s)
+
